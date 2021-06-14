@@ -1,0 +1,153 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# # SIVmac239M analysis pipeline 
+# ### Modified from Athena Golfinos and Brandon Keele
+# January 28, 2021
+# 
+# ## Steps:
+# #### 1: Download files into the proper location 
+# #### 2: Demultiplex files 
+
+
+""" Import modules """
+import os
+import pandas as pd
+import glob
+from Bio import SeqIO
+from Bio.Seq import Seq
+import collections 
+from fastqandfurious import fastqandfurious
+from fastqandfurious.fastqandfurious import entryfunc
+
+
+""" We also need to make sure that we have necessary information:
+    Where are the fastq files we need?
+    What experiment is this? 
+    What index reads are there? 
+    What barcodes are we looking for? """
+
+ROOT = "/Users/ryanmoriarty/Documents/SIV_barcoding_for_Pediatric_samples/"
+EXPT = "6346"
+INDICES = pd.read_csv(ROOT + "analysis_tools/index_ids.csv", sep = ',', header = None)
+BARCODES = [(b.id, b.seq) for b in SeqIO.parse(ROOT + "/analysis_tools/SIV239MReferenceSequences.fasta", "fasta")]
+P7 = "TAGATCGTC" #this is the P7 universal primer on the 5' end
+pre_index = "GAGGTTCTGG"
+pre_index_reverse_complement = "CCAGAACCTC"
+
+os.chdir(ROOT + EXPT)
+
+# Make a list of the samples 
+samples = [f for f in glob.glob("*.fastq")]
+sample_index = [s[s.find("P5."):s.find(".fastq")] for s in samples]
+zipped = [f for f in glob.glob("*.gz")]
+fastqs = [ROOT+EXPT+"/" + file for file in glob.glob("*.fastq")] 
+fasta_seqs = [SeqIO.parse(open(f), "fastq") for f in fastqs]
+
+print(samples)
+
+def fastq_file_lists(fastq_files):
+    # pull in the sequences 
+    seqs = []
+    bufsize = 200000
+    with open(fastq_files, "rb") as fh:
+        it = fastqandfurious.readfastq_iter(fh, bufsize, entryfunc)
+        for sequence in it:
+            # sequence[1] is the nucleotide sequence, sequence[2] is the quality scores 
+            seqs.append((str(sequence[1])[2:-2], str(sequence[2])[2:-2]))
+    
+    preidx = []
+    rcidx = []
+    preidx_not_found = []
+    for a in seqs:
+        if pre_index in a[0]:
+            preidx.append(a[0].index(pre_index))
+        elif pre_index_reverse_complement in a[0]: 
+            rcidx.append(a[0].index(pre_index_reverse_complement))
+        else:
+            preidx_not_found.append(a)
+    seqs_rc = []
+    if len(rcidx) > len(preidx):
+        for a in seqs:
+             seqs_rc.append((str(Seq(a[0]).reverse_complement()), a[1][::-1]))
+        seqs = seqs_rc
+        print("samples are reverse transcribed ")
+            
+    return seqs
+
+""" Sort the counter object to determine % barcodes """
+
+def demultiplex(file, indices, write_files=True):
+    """
+    Demultiplexes the Miseq file and separates them into individual samples
+    
+    Args:
+        file = the non-demultiplexed R1 or R2 file, save as .fastq
+        indices = the P5.XX used to label each sample
+        
+    Returns:
+        list of demultiplexed samples:
+            "Unknown_tag" - these are samples where the pre-index sequence "GAGGTTCTGG" or its reverese complement 
+                was found, but the subseequent 8 base pairs, where the tag should be, was not present in the list of known 
+                index tags. 
+            "Unindexed" - these are samples where the pre-index sequence "GAGGTTCTGG" or its reverse complement was 
+                NOT found, so we didn't look for the index tag either.
+            All other samples will be labeled with their index tag "P5.XX"
+                
+    
+    """
+    
+    file_end = file[file.rfind("/")+1:file.rfind(".fastq")]
+    all_seqs = fastq_file_lists(file)
+    
+    index_names = list(indices[0])
+    index_seqs = list(indices[1])
+    index_seqs_rc = list(indices[2])
+    
+    # find where the indices are hiding 
+    dmux_samples = dict()
+    for a in all_seqs:
+        if pre_index in a[0]:
+            start = a[0].index(pre_index)+10
+            tag = a[0][start:start+8]
+            if tag in index_seqs:
+                name = index_names[index_seqs.index(tag)] + "_rc"
+                dmux_samples.setdefault(name, []).append(a)
+            elif tag in index_seqs_rc:
+                name = index_names[index_seqs_rc.index(tag)] 
+                dmux_samples.setdefault(name, []).append(a)
+            else:
+                dmux_samples.setdefault("Unknown_tag", []).append(a)
+        elif pre_index_reverse_complement in a[0]:
+            start = a[0].index(pre_index_reverse_complement)+10
+            tag = a[0][start:start+8]
+            if tag in index_seqs:
+                name = index_names[index_seqs.index(tag)] + "_rc"
+                dmux_samples.setdefault(name, []).append(a) 
+            elif tag in index_seqs_rc:
+                name = index_names[index_seqs_rc.index(tag)] 
+                dmux_samples.setdefault(name, []).append(a)
+            else:
+                dmux_samples.setdefault("Unknown_tag", []).append(a)
+        else:
+            dmux_samples.setdefault("Unindexed", []).append(a)
+    
+    index_keys = list(dmux_samples.keys())
+    real_tags_found = len(list(filter(lambda element: 'P' in element, index_keys)))
+    
+    if real_tags_found > 0:
+        if write_files:
+            for i in index_keys:
+                print("Writing sample index: ", i)
+                data = dmux_samples.get(i)
+                sample_fastq = open(file_end + "_" + i + "_demultiplexed.fastq", "w")
+                l = 0
+                for line in data:
+                    l += 1
+                    sample_fastq.write("@" + i + "." + str(l) + "\n" + line[0] + "\n+\n" + line[1] + "\n" )
+                sample_fastq.close()
+    else:
+        print("No known index tags found, try different read.")
+    
+    return dmux_samples
+
